@@ -6,7 +6,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from urllib.parse import quote
 
 import requests
@@ -136,14 +136,16 @@ def extract_uploaded_files(files) -> str:
     return "\n".join(part for part in extracted if part.strip())
 
 
-def analyze_all_sources(pasted: str, files) -> tuple[list[dict], int]:
+def analyze_all_sources(pasted: str, files) -> tuple[list[dict], int, list[dict]]:
     uploaded_text = extract_uploaded_files(files)
     parts = [part.strip() for part in (pasted, uploaded_text) if part and part.strip()]
     if not parts:
         raise AnalysisError("No encontramos gastos para analizar.")
     source = "\n".join(parts)
     findings = analyze_with_groq(source)
-    return findings, len(findings)
+    evidence = parse_evidence(source)
+    enrich_with_evidence(findings, evidence)
+    return findings, len(findings), evidence
 
 
 def analyze_with_groq(raw_expenses: str) -> list[dict]:
@@ -231,24 +233,42 @@ GASTOS CRUDOS:
     return normalized
 
 
+OPTIONAL_HEADERS = {
+    "servicio", "monto", "fecha", "periodicidad", "proxima_renovacion",
+    "ultimo_uso", "estado_uso", "proyecto",
+}
+
+
 def parse_input(text: str) -> tuple[list[dict[str, str]], list[str]]:
-    """Valida las tres columnas esperadas sin alterar el análisis demo."""
+    """Valida el CSV básico y las columnas opcionales de evidencia."""
     records: list[dict[str, str]] = []
     errors: list[str] = []
     if not text.strip():
         return records, errors
+    non_empty_lines = [line for line in text.splitlines() if line.strip()]
+    if non_empty_lines and not all("," in line for line in non_empty_lines):
+        return records, errors
 
     rows = list(csv.reader(io.StringIO(text.strip())))
-    if rows and [cell.strip().lower() for cell in rows[0]] == ["servicio", "monto", "fecha"]:
-        rows = rows[1:]
+    header = [cell.strip().lower() for cell in rows[0]] if rows else []
+    has_header = bool(header and {"servicio", "monto", "fecha"}.issubset(header))
+    if has_header:
+        unknown = set(header) - OPTIONAL_HEADERS
+        if unknown:
+            errors.append("Encabezados desconocidos: " + ", ".join(sorted(unknown)) + ".")
+        data_rows = rows[1:]
+    else:
+        header = ["servicio", "monto", "fecha"]
+        data_rows = rows
 
-    for index, row in enumerate(rows, start=1):
+    for index, row in enumerate(data_rows, start=2 if has_header else 1):
         if not row or all(not cell.strip() for cell in row):
             continue
-        if len(row) != 3:
-            errors.append(f"Línea {index}: se esperaban 3 campos separados por comas.")
+        if len(row) != len(header):
+            errors.append(f"Línea {index}: se esperaban {len(header)} campos separados por comas.")
             continue
-        service, amount, date_value = (cell.strip() for cell in row)
+        record = dict(zip(header, (cell.strip() for cell in row)))
+        service, amount, date_value = record["servicio"], record["monto"], record["fecha"]
         try:
             float(amount.replace("US$", "").replace("USD", "").strip())
             datetime.strptime(date_value, "%Y-%m-%d")
@@ -258,8 +278,102 @@ def parse_input(text: str) -> tuple[list[dict[str, str]], list[str]]:
         if not service:
             errors.append(f"Línea {index}: el servicio no puede quedar vacío.")
             continue
-        records.append({"servicio": service, "monto": amount, "fecha": date_value})
+        for field in ("proxima_renovacion", "ultimo_uso"):
+            if record.get(field):
+                try:
+                    datetime.strptime(record[field], "%Y-%m-%d")
+                except ValueError:
+                    errors.append(f"Línea {index}: {field} debe usar AAAA-MM-DD.")
+        if record.get("periodicidad", "mensual").lower() not in {"mensual", "anual"}:
+            errors.append(f"Línea {index}: periodicidad debe ser mensual o anual.")
+        if record.get("estado_uso", "desconocido").lower() not in {"activo", "inactivo", "desconocido", ""}:
+            errors.append(f"Línea {index}: estado_uso debe ser activo, inactivo o desconocido.")
+        records.append(record)
     return records, errors
+
+
+def parse_evidence(text: str) -> list[dict]:
+    """Obtiene evidencia estructurada cuando la fuente es un CSV reconocible."""
+    records, errors = parse_input(text)
+    if errors:
+        return []
+    parsed = []
+    for record in records:
+        periodicity = record.get("periodicidad", "").lower()
+        annual = periodicity == "anual" or " anual" in record["servicio"].lower()
+        raw_amount = float(record["monto"].replace("US$", "").replace("USD", "").strip())
+        parsed.append({
+            **record,
+            "fecha_dt": datetime.strptime(record["fecha"], "%Y-%m-%d").date(),
+            "monto_mensual": raw_amount / 12 if annual else raw_amount,
+            "periodicidad": "anual" if annual else "mensual",
+        })
+    return parsed
+
+
+def enrich_with_evidence(findings: list[dict], evidence: list[dict]) -> None:
+    """Agrega hechos verificables sin reemplazar inferencias válidas del análisis."""
+    today = date.today()
+    for index, finding in enumerate(findings):
+        finding["confidence"] = "media"
+        finding["basis"] = "Inferencia de IA sobre los gastos cargados"
+        finding["flags"] = []
+        if index >= len(evidence):
+            continue
+        source = evidence[index]
+        finding["transaction_date"] = source["fecha"]
+        finding["monthly_amount"] = source["monto_mensual"]
+        finding["periodicity"] = source["periodicidad"]
+        finding["project"] = source.get("proyecto", "")
+        usage = source.get("estado_uso", "").lower()
+        last_used = source.get("ultimo_uso", "")
+        renewal = source.get("proxima_renovacion", "")
+        if usage == "activo":
+            finding["flags"].append("uso confirmado")
+            finding["confidence"] = "alta"
+            finding["basis"] = "Uso declarado por vos"
+        elif usage == "inactivo":
+            finding["signal"] = "sin_uso_probable"
+            finding["flags"].append("inactiva")
+            finding["confidence"] = "alta"
+            finding["basis"] = "Marcada como inactiva por vos"
+            finding["detail"] = "La marcaste como inactiva; conviene revisar el próximo cobro."
+        if last_used:
+            days_without_use = (today - datetime.strptime(last_used, "%Y-%m-%d").date()).days
+            finding["last_used"] = last_used
+            if days_without_use >= 60:
+                finding["signal"] = "sin_uso_probable"
+                finding["flags"].append(f"{days_without_use} días sin uso")
+                finding["confidence"] = "alta"
+                finding["basis"] = "Fecha de último uso declarada"
+                finding["detail"] = f"Hace {days_without_use} días que no la usás según la fecha cargada."
+        if renewal:
+            renewal_date = datetime.strptime(renewal, "%Y-%m-%d").date()
+            days_to_renewal = (renewal_date - today).days
+            finding["renewal_date"] = renewal
+            finding["days_to_renewal"] = days_to_renewal
+            if 0 <= days_to_renewal <= 30:
+                finding["flags"].append(f"renueva en {days_to_renewal} días")
+                if finding["signal"] in {"normal", "revisar"}:
+                    finding["signal"] = "renovación"
+                    finding["detail"] = f"Renueva en {days_to_renewal} días según la fecha cargada."
+                    finding["confidence"] = "alta"
+                    finding["basis"] = "Fecha de renovación declarada"
+
+    history: dict[str, list[tuple[int, dict]]] = {}
+    for index, source in enumerate(evidence[:len(findings)]):
+        key = source["servicio"].casefold().replace(" anual", "").strip()
+        history.setdefault(key, []).append((index, source))
+    for rows in history.values():
+        rows.sort(key=lambda pair: pair[1]["fecha_dt"])
+        for (previous_index, previous), (current_index, current) in zip(rows, rows[1:]):
+            if current["monto_mensual"] > previous["monto_mensual"]:
+                increase = (current["monto_mensual"] / previous["monto_mensual"] - 1) * 100
+                finding = findings[current_index]
+                finding["signal"] = "aumento"
+                finding["confidence"] = "alta"
+                finding["basis"] = "Dos cobros comparables cargados"
+                finding["detail"] = f"Subió {increase:.0f}% frente al cobro anterior del mismo servicio."
 
 
 def money(value: float) -> str:
@@ -285,14 +399,62 @@ def add_optimization_estimates(findings: list[dict]) -> None:
         seen_amounts.setdefault(key, []).append(item["monthly_amount"])
 
 
+def priority_score(item: dict) -> float:
+    """Ordena por impacto económico, urgencia y calidad de evidencia."""
+    score = item.get("optimization_amount", 0) * 12
+    if 0 <= item.get("days_to_renewal", 9999) <= 30:
+        score += 240 - item["days_to_renewal"] * 4
+    if item["signal"] == "sin_uso_probable":
+        score += 120
+    if item.get("confidence") == "alta":
+        score += 60
+    return score
+
+
+def current_stack(findings: list[dict]) -> list[dict]:
+    """Usa el cobro más reciente por servicio para evitar duplicar el historial."""
+    latest: dict[str, dict] = {}
+    for item in findings:
+        key = item["service"].casefold().replace(" anual", "").strip()
+        previous = latest.get(key)
+        item_date = item.get("transaction_date", "")
+        if previous is None or item_date >= previous.get("transaction_date", ""):
+            latest[key] = item
+    return sorted(latest.values(), key=priority_score, reverse=True)
+
+
+def period_summary(evidence: list[dict]) -> tuple[str, float | None]:
+    by_period: dict[str, dict[str, float]] = {}
+    for item in evidence:
+        period = item["fecha"][:7]
+        key = item["servicio"].casefold().replace(" anual", "").strip()
+        by_period.setdefault(period, {})[key] = item["monto_mensual"]
+    periods = sorted(by_period)
+    if not periods:
+        return "Sin historial comparable", None
+    if len(periods) == 1:
+        return f"Período {periods[-1]}", None
+    previous, current = by_period[periods[-2]], by_period[periods[-1]]
+    common = set(previous) & set(current)
+    previous_total = sum(previous[key] for key in common)
+    current_total = sum(current[key] for key in common)
+    if not common or previous_total == 0:
+        return "Sin servicios comparables", None
+    change = (current_total / previous_total - 1) * 100
+    return f"{periods[-2]} → {periods[-1]} · mismos servicios", change
+
+
 def findings_table(findings: list[dict]) -> str:
     rows = []
-    for item in findings:
+    for priority, item in enumerate(findings, start=1):
         foreground, background = SIGNAL_META[item["signal"]]
         rows.append(
             f'<div class="finding-row">'
             f'<div class="service-cell"><strong>{html.escape(item["service"])}</strong>'
+            f'<span class="priority-copy">Prioridad #{priority}</span>'
             f'<span>{html.escape(item["detail"])}</span>'
+            f'<span class="evidence-copy">{html.escape(item.get("basis", "Inferencia de IA"))} · confianza {html.escape(item.get("confidence", "media"))}</span>'
+            + (f'<span class="fact-copy">{" · ".join(html.escape(flag) for flag in item.get("flags", []))}</span>' if item.get("flags") else '') +
             f'<span class="action-copy">Siguiente acción: {html.escape(item.get("action", SIGNAL_ACTIONS[item["signal"]]))}</span></div>'
             f'<div class="amount-cell">US$ {money(item["monthly_amount"])}/mes</div>'
             f'<div><span class="signal" style="color:{foreground};background:{background};'
@@ -342,6 +504,9 @@ st.markdown(
       .service-cell strong { color:#f1f5f2; font-size:1.02rem; }
       .service-cell span { color:#7f9287; font-size:.85rem; }
       .service-cell .action-copy { color:#d0a57f; font-size:.76rem; margin-top:.2rem; }
+      .service-cell .evidence-copy { color:#91a399; font-size:.72rem; }
+      .service-cell .fact-copy { color:#70e795; font-size:.72rem; font-weight:750; }
+      .service-cell .priority-copy { color:#ff9a55; font-size:.68rem; font-weight:850; text-transform:uppercase; letter-spacing:.08em; }
       .amount-cell { color:#dbe5df; font-weight:750; }
       .signal { display:inline-flex; padding:.37rem .7rem; border:1px solid; border-radius:999px; font-size:.75rem; font-weight:800; white-space:nowrap; }
       .demo-note { margin-top:1rem; color:#687a70; font-size:.78rem; }
@@ -350,6 +515,14 @@ st.markdown(
       .empty-code { display:inline-block; margin-top:.4rem; padding:.65rem .8rem; background:#0a100c; border:1px solid #26362c; border-radius:9px; color:#70e795; font-family:monospace; font-size:.85rem; }
       .loading-card { display:flex; align-items:center; gap:.9rem; margin-top:1.25rem; padding:1rem 1.2rem; border:1px solid #2d4035; border-radius:14px; background:#101a14; color:#dce8e0; font-weight:700; }
       .loading-dot { width:12px; height:12px; border-radius:50%; background:#ff8a36; box-shadow:0 0 0 0 #ff8a3670; animation:pulse 1.2s infinite; }
+      .dashboard { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.7rem; margin:0 0 1rem; }
+      .metric-card { padding:.9rem 1rem; border:1px solid #29382f; border-radius:14px; background:#101914; }
+      .metric-card span { display:block; color:#7f9287; font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; }
+      .metric-card strong { display:block; color:#f1f5f2; font-size:1.35rem; margin-top:.25rem; }
+      .metric-card em { display:block; color:#8da096; font-size:.7rem; font-style:normal; margin-top:.2rem; }
+      .signal-dashboard { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.7rem; margin:0 0 1rem; }
+      .signal-card { padding:.7rem .85rem; border:1px solid #29382f; border-radius:12px; background:#0d1511; color:#91a399; font-size:.75rem; }
+      .signal-card strong { color:#f1f5f2; font-size:1.05rem; margin-right:.25rem; }
       div[data-testid="stButton"] button[kind="secondary"] { height:2.35rem; background:#141e18; color:#aebdb4; border:1px solid #314239; box-shadow:none; font-size:.8rem; }
       @keyframes pulse { 70% { box-shadow:0 0 0 10px #ff8a3600; } 100% { box-shadow:0 0 0 0 #ff8a3600; } }
       @keyframes wowReveal { from { opacity:0; transform:translateY(18px) scale(.985); } to { opacity:1; transform:none; } }
@@ -363,6 +536,8 @@ st.markdown(
         .finding-row > div:last-child { grid-column:1 / -1; }
         .service-cell, .service-cell span { min-width:0; overflow-wrap:anywhere; }
         .amount-cell { white-space:nowrap; }
+        .dashboard { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .signal-dashboard { grid-template-columns:repeat(2,minmax(0,1fr)); }
       }
       @media(max-width:560px) {
         .finding-row { grid-template-columns:1fr; }
@@ -380,18 +555,19 @@ st.markdown(
 )
 
 def reset_demo() -> None:
-    for key in ("findings", "record_count", "expenses_input", "expenses_file"):
+    for key in ("findings", "record_count", "evidence", "expenses_input", "expenses_file"):
         st.session_state.pop(key, None)
 
 
-EXAMPLE_EXPENSES = """ADOBE CREATIVE CLOUD,50.00,2026-07-03
-ADOBE CREATIVE CLOUD,59.00,2026-08-03
-CANVA PRO,15.00,2026-08-04
-OPENAI CHATGPT,20.00,2026-08-05
-NOTION AI,10.00,2026-08-06
-ENVATO ELEMENTS,16.50,2026-08-07
-ELEMENTOR PRO ANUAL,99.00,2026-08-10
-HOSTINGER,12.00,2026-08-11"""
+EXAMPLE_EXPENSES = """servicio,monto,fecha,periodicidad,proxima_renovacion,ultimo_uso,estado_uso,proyecto
+ADOBE CREATIVE CLOUD,50.00,2026-07-03,mensual,,2026-08-20,activo,Diseño
+ADOBE CREATIVE CLOUD,59.00,2026-08-03,mensual,,2026-08-20,activo,Diseño
+CANVA PRO,15.00,2026-08-04,mensual,,2026-08-18,activo,Contenido
+OPENAI CHATGPT,20.00,2026-08-05,mensual,,2026-08-22,activo,Operaciones
+NOTION AI,10.00,2026-08-06,mensual,,2026-08-12,activo,Operaciones
+ENVATO ELEMENTS,16.50,2026-08-07,mensual,2026-09-07,2026-05-10,inactivo,Assets
+ELEMENTOR PRO,99.00,2026-08-10,anual,2026-09-03,2026-08-01,activo,Web cliente
+HOSTINGER,12.00,2026-08-11,mensual,,,desconocido,Proyecto pausado"""
 
 
 def load_example() -> None:
@@ -404,7 +580,7 @@ with left:
         "Pegá tus gastos",
         height=155,
         placeholder="Adobe CC,59,2026-08-02\nChatGPT,20,2026-08-05\nCanva Pro,15,2026-08-11",
-        help="Una línea por gasto: servicio, monto, fecha (AAAA-MM-DD).",
+        help="Formato mínimo: servicio, monto, fecha. Para resultados comprobables podés sumar periodicidad, proxima_renovacion, ultimo_uso, estado_uso y proyecto.",
         key="expenses_input",
     )
     st.button("Cargar ejemplo", on_click=load_example, type="secondary", use_container_width=True)
@@ -417,6 +593,13 @@ with right:
         key="expenses_file",
     )
     st.caption("CSV · PDF · imagen · Sin conexión bancaria")
+
+with st.expander("Cómo obtener resultados comprobables", expanded=False):
+    st.markdown("""
+    El formato mínimo sigue siendo `servicio,monto,fecha`. Para confirmar uso y renovaciones usá un CSV con:
+    `servicio,monto,fecha,periodicidad,proxima_renovacion,ultimo_uso,estado_uso,proyecto`.
+    Los estados admitidos son `activo`, `inactivo` o `desconocido`. Si no cargás evidencia, la app lo presenta como inferencia.
+    """)
 
 analyze = st.button("Analizar stack  →", type="primary")
 
@@ -440,12 +623,13 @@ if analyze:
                     )
                     message_index += 1
                     time.sleep(1.25)
-                findings_result, record_count = future.result()
+                findings_result, record_count, evidence = future.result()
                 for finding in findings_result:
                     finding["action"] = SIGNAL_ACTIONS[finding["signal"]]
                 add_optimization_estimates(findings_result)
                 st.session_state["findings"] = findings_result
                 st.session_state["record_count"] = record_count
+                st.session_state["evidence"] = evidence
         except AnalysisError:
             st.session_state.pop("findings", None)
             st.error("No pudimos analizar esto. Probá de nuevo en unos segundos.")
@@ -456,12 +640,23 @@ if analyze:
             loading.empty()
 
 if st.session_state.get("findings"):
-    findings = st.session_state["findings"]
+    all_findings = st.session_state["findings"]
+    findings = current_stack(all_findings)
+    evidence = st.session_state.get("evidence", [])
     monthly_potential = sum(item.get("optimization_amount", item["monthly_amount"] if item["signal"] != "normal" else 0) for item in findings)
     annual_potential = monthly_potential * 12
     monthly_stack = sum(item["monthly_amount"] for item in findings)
     opportunity_count = sum(item["signal"] != "normal" for item in findings)
     normal_count = len(findings) - opportunity_count
+    active_count = sum("uso confirmado" in item.get("flags", []) for item in findings)
+    inactive_count = sum("inactiva" in item.get("flags", []) for item in findings)
+    suspected_unused_count = sum(item["signal"] == "sin_uso_probable" for item in findings)
+    renewal_count = sum(0 <= item.get("days_to_renewal", 9999) <= 30 for item in findings)
+    increase_count = sum(item["signal"] == "aumento" for item in findings)
+    duplicate_count = sum(item["signal"] == "duplicación" for item in findings)
+    review_count = sum(item["signal"] == "revisar" for item in findings)
+    period_label, period_change = period_summary(evidence)
+    change_text = "sin comparación" if period_change is None else f"{period_change:+.1f}%"
     opportunity_label = "oportunidad detectada" if opportunity_count == 1 else "oportunidades detectadas"
     normal_label = "gasto normal" if normal_count == 1 else "gastos normales"
     st.markdown(
@@ -476,6 +671,19 @@ if st.session_state.get("findings"):
             <span class="summary-pill normal">{normal_count} {normal_label}</span>
           </div>
         </div>
+        <div class="dashboard">
+          <div class="metric-card"><span>Stack actual</span><strong>US$ {money(monthly_stack)}/mes</strong><em>último cobro por servicio</em></div>
+          <div class="metric-card"><span>Variación cargada</span><strong>{change_text}</strong><em>{period_label}</em></div>
+          <div class="metric-card"><span>Uso declarado</span><strong>{active_count} activas · {inactive_count} inactivas</strong><em>solo evidencia aportada</em></div>
+          <div class="metric-card"><span>Renovación ≤ 30 días</span><strong>{renewal_count}</strong><em>fechas confirmadas</em></div>
+        </div>
+        <div class="signal-dashboard">
+          <div class="signal-card"><strong>{duplicate_count}</strong> duplicaciones</div>
+          <div class="signal-card"><strong>{increase_count}</strong> aumentos</div>
+          <div class="signal-card"><strong>{suspected_unused_count}</strong> poco usadas/inactivas</div>
+          <div class="signal-card"><strong>{review_count}</strong> para revisar</div>
+        </div>
+        <div class="demo-note">Ordenado por impacto anual, urgencia y confianza de la evidencia.</div>
         <div class="findings-wrap">{findings_table(findings)}
           <div class="demo-note">Demo CoderCup · Análisis generado por IA. Los datos no se guardan en una base de datos.</div>
         </div>

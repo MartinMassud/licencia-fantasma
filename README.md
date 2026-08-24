@@ -25,5 +25,22 @@ También podés definir la variable de entorno `GROQ_API_KEY`.
 - Normalización, recurrencias, señales y explicaciones en español.
 - Acciones sugeridas y recordatorios preparados para WhatsApp o email.
 - Proyección mensual y anual con aumentos calculados sobre la diferencia.
+- Historial por períodos con comparación equivalente de los mismos servicios.
+- Campos opcionales para confirmar periodicidad, próxima renovación, último uso, estado de uso y proyecto.
+- Separación visible entre evidencia declarada e inferencias de IA, con nivel de confianza.
+- Stack actual sin duplicar cobros históricos y ranking por impacto, urgencia y confianza.
+- Resumen de licencias activas/inactivas declaradas y renovaciones dentro de 30 días.
+
+## CSV con evidencia opcional
+
+El formato mínimo sigue siendo `servicio,monto,fecha`. Para confirmar señales en lugar de inferirlas:
+
+```csv
+servicio,monto,fecha,periodicidad,proxima_renovacion,ultimo_uso,estado_uso,proyecto
+ELEMENTOR PRO,99,2026-08-10,anual,2026-09-03,2026-08-01,activo,Web cliente
+ENVATO ELEMENTS,16.50,2026-08-07,mensual,2026-09-07,2026-05-10,inactivo,Assets
+```
+
+Sin esos campos, las duplicaciones y el uso probable se muestran explícitamente como inferencias, no como hechos confirmados.
 - Sin base de datos, conexión bancaria ni credenciales financieras.
 - Datos conservados únicamente durante la sesión de Streamlit.
