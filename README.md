@@ -1,6 +1,6 @@
 # Licencia Fantasma
 
-MVP para detectar aumentos, duplicaciones, suscripciones sospechosas y renovaciones próximas en gastos de software/SaaS.
+MVP para encontrar señales de aumentos, duplicaciones, suscripciones sospechosas y renovaciones próximas en gastos de software/SaaS.
 
 ## Ejecutar localmente
 
@@ -20,8 +20,10 @@ También podés definir la variable de entorno `GROQ_API_KEY`.
 
 ## Alcance
 
-- Entrada por texto o CSV.
-- Análisis mediante un único llamado a Groq.
-- Sin base de datos, conexión bancaria, PDF u OCR.
+- Entrada por texto, CSV, PDF o imagen/factura.
+- Extracción de texto y OCR visual mediante Groq.
+- Normalización, recurrencias, señales y explicaciones en español.
+- Acciones sugeridas y recordatorios preparados para WhatsApp o email.
+- Proyección mensual y anual con aumentos calculados sobre la diferencia.
+- Sin base de datos, conexión bancaria ni credenciales financieras.
 - Datos conservados únicamente durante la sesión de Streamlit.
-

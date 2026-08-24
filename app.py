@@ -1,4 +1,5 @@
 import csv
+import base64
 import html
 import io
 import json
@@ -6,9 +7,11 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
 import streamlit as st
+from pypdf import PdfReader
 
 
 st.set_page_config(
@@ -39,13 +42,21 @@ SIGNAL_LABELS = {
 
 ALLOWED_SIGNALS = set(SIGNAL_META)
 
+SIGNAL_ACTIONS = {
+    "aumento": "Comparar con el mes anterior y evaluar un plan más barato.",
+    "duplicación": "Elegir una herramienta principal y revisar la otra.",
+    "normal": "Mantener y volver a revisar el próximo mes.",
+    "sin_uso_probable": "Confirmar el último uso antes de la próxima renovación.",
+    "renovación": "Agendar la decisión antes de que vuelva a cobrar.",
+    "revisar": "Validar uso, responsable y proyecto asociado.",
+}
+
 
 class AnalysisError(Exception):
     """Error seguro para mostrar en la interfaz."""
 
 
-def analyze_with_groq(raw_expenses: str) -> list[dict]:
-    """Normaliza, detecta y explica todos los gastos en un único llamado."""
+def get_groq_key() -> str:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         try:
@@ -54,6 +65,90 @@ def analyze_with_groq(raw_expenses: str) -> list[dict]:
             api_key = None
     if not api_key:
         raise AnalysisError("La integración con Groq no está configurada en este entorno.")
+    return api_key
+
+
+def extract_image_with_groq(file_bytes: bytes, mime_type: str) -> str:
+    """Extrae movimientos visibles de una factura o captura usando visión."""
+    api_key = get_groq_key()
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+            json={
+                "model": "qwen/qwen3.6-27b",
+                "temperature": 0.7,
+                "reasoning_effort": "none",
+                "reasoning_format": "hidden",
+                "max_completion_tokens": 2048,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extraé únicamente gastos de software/SaaS visibles. Devolvé una línea CSV por movimiento: servicio,monto,fecha. Usá AAAA-MM-DD; si falta la fecha, usá fecha_desconocida. No agregues comentarios ni inventes datos."},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+                    ],
+                }],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        raise AnalysisError("No pudimos leer la imagen. Probá con una captura más nítida.") from exc
+
+
+def extract_uploaded_files(files) -> str:
+    """Convierte CSV, PDF e imágenes en un bloque de texto para el análisis."""
+    extracted = []
+    for uploaded in files or []:
+        suffix = uploaded.name.rsplit(".", 1)[-1].lower()
+        data = uploaded.getvalue()
+        if suffix == "csv":
+            try:
+                extracted.append(data.decode("utf-8-sig"))
+            except UnicodeDecodeError as exc:
+                raise AnalysisError(f"No pudimos leer {uploaded.name}. Guardalo como CSV UTF-8.") from exc
+        elif suffix == "pdf":
+            try:
+                pdf = PdfReader(io.BytesIO(data))
+                text_parts = []
+                image_count = 0
+                for page in pdf.pages:
+                    page_text = (page.extract_text() or "").strip()
+                    if page_text:
+                        text_parts.append(page_text)
+                    elif page.images and image_count < 5:
+                        page_image = page.images[0]
+                        extension = page_image.name.rsplit(".", 1)[-1].lower()
+                        mime = "image/jpeg" if extension in {"jpg", "jpeg"} else "image/png"
+                        text_parts.append(extract_image_with_groq(page_image.data, mime))
+                        image_count += 1
+                text = "\n".join(text_parts).strip()
+            except Exception as exc:
+                raise AnalysisError(f"No pudimos leer el PDF {uploaded.name}.") from exc
+            if not text:
+                raise AnalysisError(f"No encontramos gastos legibles en {uploaded.name}.")
+            extracted.append(text)
+        elif suffix in {"png", "jpg", "jpeg", "webp"}:
+            mime = "image/jpeg" if suffix in {"jpg", "jpeg"} else f"image/{suffix}"
+            extracted.append(extract_image_with_groq(data, mime))
+    return "\n".join(part for part in extracted if part.strip())
+
+
+def analyze_all_sources(pasted: str, files) -> tuple[list[dict], int]:
+    uploaded_text = extract_uploaded_files(files)
+    parts = [part.strip() for part in (pasted, uploaded_text) if part and part.strip()]
+    if not parts:
+        raise AnalysisError("No encontramos gastos para analizar.")
+    source = "\n".join(parts)
+    findings = analyze_with_groq(source)
+    return findings, len(findings)
+
+
+def analyze_with_groq(raw_expenses: str) -> list[dict]:
+    """Normaliza, detecta y explica todos los gastos en un único llamado."""
+    api_key = get_groq_key()
 
     prompt = f"""Sos un analista de gastos SaaS para freelancers de Uruguay y Latinoamérica.
 Analizá TODOS los gastos del bloque de entrada en una sola pasada: normalizá el nombre del servicio, detectá señales y explicá cada resultado.
@@ -172,6 +267,24 @@ def money(value: float) -> str:
     return f"{rounded:,}".replace(",", ".") if abs(value - rounded) < 0.005 else f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def add_optimization_estimates(findings: list[dict]) -> None:
+    """Evita contar la suscripción completa cuando la señal es solo un aumento."""
+    seen_amounts: dict[str, list[float]] = {}
+    for item in findings:
+        key = item["service"].casefold()
+        previous = seen_amounts.get(key, [])
+        if item["signal"] == "normal":
+            estimate = 0.0
+        elif item["signal"] == "aumento" and previous:
+            estimate = max(0.0, item["monthly_amount"] - previous[-1])
+        elif item["signal"] == "aumento":
+            estimate = 0.0
+        else:
+            estimate = item["monthly_amount"]
+        item["optimization_amount"] = estimate
+        seen_amounts.setdefault(key, []).append(item["monthly_amount"])
+
+
 def findings_table(findings: list[dict]) -> str:
     rows = []
     for item in findings:
@@ -179,7 +292,8 @@ def findings_table(findings: list[dict]) -> str:
         rows.append(
             f'<div class="finding-row">'
             f'<div class="service-cell"><strong>{html.escape(item["service"])}</strong>'
-            f'<span>{html.escape(item["detail"])}</span></div>'
+            f'<span>{html.escape(item["detail"])}</span>'
+            f'<span class="action-copy">Siguiente acción: {html.escape(item.get("action", SIGNAL_ACTIONS[item["signal"]]))}</span></div>'
             f'<div class="amount-cell">US$ {money(item["monthly_amount"])}/mes</div>'
             f'<div><span class="signal" style="color:{foreground};background:{background};'
             f'border-color:{foreground}33">{html.escape(SIGNAL_LABELS[item["signal"]])}</span></div>'
@@ -227,6 +341,7 @@ st.markdown(
       .service-cell { display:flex; flex-direction:column; gap:.28rem; }
       .service-cell strong { color:#f1f5f2; font-size:1.02rem; }
       .service-cell span { color:#7f9287; font-size:.85rem; }
+      .service-cell .action-copy { color:#d0a57f; font-size:.76rem; margin-top:.2rem; }
       .amount-cell { color:#dbe5df; font-weight:750; }
       .signal { display:inline-flex; padding:.37rem .7rem; border:1px solid; border-radius:999px; font-size:.75rem; font-weight:800; white-space:nowrap; }
       .demo-note { margin-top:1rem; color:#687a70; font-size:.78rem; }
@@ -269,12 +384,13 @@ def reset_demo() -> None:
         st.session_state.pop(key, None)
 
 
-EXAMPLE_EXPENSES = """ADOBE CREATIVE CLOUD,59.00,2026-08-03
+EXAMPLE_EXPENSES = """ADOBE CREATIVE CLOUD,50.00,2026-07-03
+ADOBE CREATIVE CLOUD,59.00,2026-08-03
 CANVA PRO,15.00,2026-08-04
 OPENAI CHATGPT,20.00,2026-08-05
 NOTION AI,10.00,2026-08-06
 ENVATO ELEMENTS,16.50,2026-08-07
-ELEMENTOR PRO,99.00,2026-08-10
+ELEMENTOR PRO ANUAL,99.00,2026-08-10
 HOSTINGER,12.00,2026-08-11"""
 
 
@@ -293,31 +409,29 @@ with left:
     )
     st.button("Cargar ejemplo", on_click=load_example, type="secondary", use_container_width=True)
 with right:
-    upload = st.file_uploader("O subí un archivo CSV", type=["csv"], help="Columnas requeridas: servicio, monto, fecha", key="expenses_file")
-    st.caption("Formato: servicio, monto, fecha · Sin conexión bancaria")
+    upload = st.file_uploader(
+        "O subí gastos, facturas o capturas",
+        type=["csv", "pdf", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        help="CSV, PDF con texto o hasta cinco capturas/facturas.",
+        key="expenses_file",
+    )
+    st.caption("CSV · PDF · imagen · Sin conexión bancaria")
 
 analyze = st.button("Analizar stack  →", type="primary")
 
 if analyze:
-    source = pasted
-    if upload is not None:
-        try:
-            source = upload.getvalue().decode("utf-8-sig")
-        except UnicodeDecodeError:
-            st.error("No pudimos leer el CSV. Guardalo con codificación UTF-8.")
-            st.stop()
-
-    records, errors = parse_input(source)
-    if not source.strip():
+    records, errors = parse_input(pasted) if pasted.strip() else ([], [])
+    if not pasted.strip() and not upload:
         st.warning("Pegá al menos un gasto o subí un CSV para comenzar.")
-    elif errors:
+    elif errors and not upload:
         st.error("Hay datos que necesitan corrección:\n\n" + "\n\n".join(f"• {error}" for error in errors))
-    elif records:
+    else:
         loading = st.empty()
         messages = ("Leyendo tus gastos...", "Buscando duplicados...", "Calculando el impacto anual...")
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(analyze_with_groq, source)
+                future = executor.submit(analyze_all_sources, pasted, upload)
                 message_index = 0
                 while not future.done():
                     loading.markdown(
@@ -326,8 +440,12 @@ if analyze:
                     )
                     message_index += 1
                     time.sleep(1.25)
-                st.session_state["findings"] = future.result()
-                st.session_state["record_count"] = len(records)
+                findings_result, record_count = future.result()
+                for finding in findings_result:
+                    finding["action"] = SIGNAL_ACTIONS[finding["signal"]]
+                add_optimization_estimates(findings_result)
+                st.session_state["findings"] = findings_result
+                st.session_state["record_count"] = record_count
         except AnalysisError:
             st.session_state.pop("findings", None)
             st.error("No pudimos analizar esto. Probá de nuevo en unos segundos.")
@@ -339,11 +457,13 @@ if analyze:
 
 if st.session_state.get("findings"):
     findings = st.session_state["findings"]
-    monthly_potential = sum(item["monthly_amount"] for item in findings if item["signal"] != "normal")
+    monthly_potential = sum(item.get("optimization_amount", item["monthly_amount"] if item["signal"] != "normal" else 0) for item in findings)
     annual_potential = monthly_potential * 12
     monthly_stack = sum(item["monthly_amount"] for item in findings)
     opportunity_count = sum(item["signal"] != "normal" for item in findings)
     normal_count = len(findings) - opportunity_count
+    opportunity_label = "oportunidad detectada" if opportunity_count == 1 else "oportunidades detectadas"
+    normal_label = "gasto normal" if normal_count == 1 else "gastos normales"
     st.markdown(
         f"""
         <div class="wow-card">
@@ -352,8 +472,8 @@ if st.session_state.get("findings"):
           <div class="saving-sub">US$ {money(monthly_potential)} por mes para revisar · Stack analizado: US$ {money(monthly_stack)}/mes.</div>
           <div class="saving-explainer">Potencial estimado si revisás licencias duplicadas, poco usadas o innecesarias. No es un ahorro garantizado.</div>
           <div class="result-summary">
-            <span class="summary-pill opportunity">{opportunity_count} oportunidades detectadas</span>
-            <span class="summary-pill normal">{normal_count} gastos normales</span>
+            <span class="summary-pill opportunity">{opportunity_count} {opportunity_label}</span>
+            <span class="summary-pill normal">{normal_count} {normal_label}</span>
           </div>
         </div>
         <div class="findings-wrap">{findings_table(findings)}
@@ -365,10 +485,38 @@ if st.session_state.get("findings"):
     _, reset_col = st.columns([4, 1.35])
     with reset_col:
         st.button("Probar con otro ejemplo", on_click=reset_demo, type="secondary", use_container_width=True)
+
+    reviewable = [item for item in findings if item["signal"] != "normal"]
+    if reviewable:
+        st.markdown("#### Recordarme revisar")
+        selected_service = st.selectbox(
+            "Elegí una licencia",
+            options=[item["service"] for item in reviewable],
+            label_visibility="collapsed",
+        )
+        reminder_item = next(item for item in reviewable if item["service"] == selected_service)
+        reminder_text = (
+            f"Recordatorio Licencia Fantasma: revisar {reminder_item['service']} "
+            f"(US$ {money(reminder_item['monthly_amount'])}/mes). "
+            f"{reminder_item.get('action', SIGNAL_ACTIONS[reminder_item['signal']])}"
+        )
+        reminder_left, reminder_right = st.columns(2)
+        with reminder_left:
+            st.link_button(
+                "Enviar por WhatsApp",
+                f"https://wa.me/?text={quote(reminder_text)}",
+                use_container_width=True,
+            )
+        with reminder_right:
+            st.link_button(
+                "Preparar email",
+                f"mailto:?subject={quote('Revisar licencia: ' + reminder_item['service'])}&body={quote(reminder_text)}",
+                use_container_width=True,
+            )
 else:
     st.markdown(
         '<div class="empty-state"><strong>¿No sabés por dónde empezar?</strong>'
-        'Pegá tres gastos con servicio, monto y fecha. Por ejemplo:<br>'
+        'Pegá gastos con servicio, monto y fecha, o subí un CSV, PDF o captura. Por ejemplo:<br>'
         '<span class="empty-code">ChatGPT,20,2026-08-05<br>Canva Pro,15,2026-08-11</span></div>',
         unsafe_allow_html=True,
     )
