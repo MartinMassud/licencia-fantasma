@@ -30,6 +30,7 @@ También podés definir la variable de entorno `GROQ_API_KEY`.
 - Separación visible entre evidencia declarada e inferencias de IA, con nivel de confianza.
 - Stack actual sin duplicar cobros históricos y ranking por impacto, urgencia y confianza.
 - Resumen de licencias activas/inactivas declaradas y renovaciones dentro de 30 días.
+- Agrupación por función para detectar posibles solapamientos entre licencias similares y ver su costo mensual conjunto.
 
 ## CSV con evidencia opcional
 
