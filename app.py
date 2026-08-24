@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 import requests
 import streamlit as st
+from PIL import Image, ImageOps
 from pypdf import PdfReader
 
 
@@ -105,10 +106,23 @@ def get_groq_key() -> str:
     return api_key
 
 
+def optimize_image_for_ocr(file_bytes: bytes, original_mime: str) -> tuple[bytes, str]:
+    """Reduce capturas grandes y normaliza orientación para mejorar el OCR visual."""
+    try:
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(file_bytes))).convert("RGB")
+        image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=88, optimize=True)
+        return output.getvalue(), "image/jpeg"
+    except Exception:
+        return file_bytes, original_mime
+
+
 def extract_image_with_groq(file_bytes: bytes, mime_type: str) -> str:
     """Extrae movimientos visibles de una factura o captura usando visión."""
     api_key = get_groq_key()
-    encoded = base64.b64encode(file_bytes).decode("ascii")
+    optimized_bytes, optimized_mime = optimize_image_for_ocr(file_bytes, mime_type)
+    encoded = base64.b64encode(optimized_bytes).decode("ascii")
     try:
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -123,7 +137,7 @@ def extract_image_with_groq(file_bytes: bytes, mime_type: str) -> str:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Extraé únicamente gastos de software/SaaS visibles. Devolvé una línea CSV por movimiento: servicio,monto,fecha. Usá AAAA-MM-DD; si falta la fecha, usá fecha_desconocida. No agregues comentarios ni inventes datos."},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:{optimized_mime};base64,{encoded}"}},
                     ],
                 }],
             },
@@ -131,6 +145,13 @@ def extract_image_with_groq(file_bytes: bytes, mime_type: str) -> str:
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 429:
+            raise AnalysisError("Groq alcanzó su límite temporal mientras leía la imagen.") from exc
+        if status == 413:
+            raise AnalysisError("La imagen sigue siendo demasiado grande para procesarla.") from exc
+        raise AnalysisError("No pudimos procesar la imagen con el servicio visual.") from exc
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
         raise AnalysisError("No pudimos leer la imagen. Probá con una captura más nítida.") from exc
 
@@ -173,16 +194,26 @@ def extract_uploaded_files(files) -> str:
     return "\n".join(part for part in extracted if part.strip())
 
 
-def analyze_all_sources(pasted: str, files) -> tuple[list[dict], int, list[dict]]:
-    uploaded_text = extract_uploaded_files(files)
-    parts = [part.strip() for part in (pasted, uploaded_text) if part and part.strip()]
+def analyze_all_sources(pasted: str, files) -> tuple[list[dict], int, list[dict], list[str]]:
+    uploaded_parts = []
+    upload_errors = []
+    for uploaded in files or []:
+        try:
+            extracted = extract_uploaded_files([uploaded])
+            if extracted.strip():
+                uploaded_parts.append(extracted)
+        except AnalysisError as exc:
+            upload_errors.append(f"{uploaded.name}: {exc}")
+    parts = [part.strip() for part in (pasted, *uploaded_parts) if part and part.strip()]
     if not parts:
+        if upload_errors:
+            raise AnalysisError("No pudimos leer ninguno de los archivos. " + " ".join(upload_errors))
         raise AnalysisError("No encontramos gastos para analizar.")
     source = "\n".join(parts)
     findings = analyze_with_groq(source)
     evidence = parse_evidence(source)
     enrich_with_evidence(findings, evidence)
-    return findings, len(findings), evidence
+    return findings, len(findings), evidence, upload_errors
 
 
 def analyze_with_groq(raw_expenses: str) -> list[dict]:
@@ -678,7 +709,7 @@ st.markdown(
 )
 
 def reset_demo() -> None:
-    for key in ("findings", "record_count", "evidence", "expenses_input", "expenses_file"):
+    for key in ("findings", "record_count", "evidence", "source_warnings", "expenses_input", "expenses_file"):
         st.session_state.pop(key, None)
 
 
@@ -746,13 +777,14 @@ if analyze:
                     )
                     message_index += 1
                     time.sleep(1.25)
-                findings_result, record_count, evidence = future.result()
+                findings_result, record_count, evidence, source_warnings = future.result()
                 for finding in findings_result:
                     finding["action"] = SIGNAL_ACTIONS[finding["signal"]]
                 add_optimization_estimates(findings_result)
                 st.session_state["findings"] = findings_result
                 st.session_state["record_count"] = record_count
                 st.session_state["evidence"] = evidence
+                st.session_state["source_warnings"] = source_warnings
         except AnalysisError as exc:
             st.session_state.pop("findings", None)
             st.error(f"No pudimos analizar esto. {exc}")
@@ -768,6 +800,12 @@ if st.session_state.get("findings"):
     add_conservative_overlap_estimates(findings)
     findings = sorted(findings, key=priority_score, reverse=True)
     evidence = st.session_state.get("evidence", [])
+    source_warnings = st.session_state.get("source_warnings", [])
+    if source_warnings:
+        st.warning(
+            "Analizamos las fuentes legibles, pero omitimos algunos archivos: "
+            + " ".join(source_warnings)
+        )
     monthly_potential = sum(item.get("optimization_amount", item["monthly_amount"] if item["signal"] != "normal" else 0) for item in findings)
     annual_potential = monthly_potential * 12
     monthly_stack = sum(item["monthly_amount"] for item in findings)
@@ -857,3 +895,4 @@ else:
         '<span class="empty-code">ChatGPT,20,2026-08-05<br>Canva Pro,15,2026-08-11</span></div>',
         unsafe_allow_html=True,
     )
+
