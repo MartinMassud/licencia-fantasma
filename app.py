@@ -341,10 +341,26 @@ def parse_input(text: str) -> tuple[list[dict[str, str]], list[str]]:
 
 
 def parse_evidence(text: str) -> list[dict]:
-    """Obtiene evidencia estructurada cuando la fuente es un CSV reconocible."""
-    records, errors = parse_input(text)
-    if errors:
-        return []
+    """Obtiene evidencia aun cuando se concatenan varios CSV con encabezados repetidos."""
+    records = []
+    header = ["servicio", "monto", "fecha"]
+    for row in csv.reader(io.StringIO(text.strip())):
+        cells = [cell.strip() for cell in row]
+        lowered = [cell.lower() for cell in cells]
+        if {"servicio", "monto", "fecha"}.issubset(lowered):
+            header = lowered
+            continue
+        if len(cells) != len(header) or not any(cells):
+            continue
+        record = dict(zip(header, cells))
+        if not record.get("servicio") or not record.get("monto") or not record.get("fecha"):
+            continue
+        try:
+            float(record["monto"].replace("US$", "").replace("USD", "").strip())
+            datetime.strptime(record["fecha"], "%Y-%m-%d")
+        except ValueError:
+            continue
+        records.append(record)
     parsed = []
     for record in records:
         periodicity = record.get("periodicidad", "").lower()
@@ -431,21 +447,34 @@ def money(value: float) -> str:
 
 
 def add_optimization_estimates(findings: list[dict]) -> None:
-    """Evita contar la suscripción completa cuando la señal es solo un aumento."""
+    """Calcula solo oportunidades defendibles; revisar o renovar no equivale a ahorrar."""
     seen_amounts: dict[str, list[float]] = {}
     for item in findings:
         key = item.get("stack_key", item["service"].casefold())
         previous = seen_amounts.get(key, [])
-        if item["signal"] == "normal":
+        if item["signal"] in {"normal", "renovación", "revisar", "duplicación"}:
             estimate = 0.0
         elif item["signal"] == "aumento" and previous:
             estimate = max(0.0, item["monthly_amount"] - previous[-1])
         elif item["signal"] == "aumento":
             estimate = 0.0
-        else:
+        elif item["signal"] == "sin_uso_probable" and item.get("confidence") == "alta":
             estimate = item["monthly_amount"]
+        else:
+            estimate = 0.0
         item["optimization_amount"] = estimate
         seen_amounts.setdefault(key, []).append(item["monthly_amount"])
+
+
+def add_conservative_overlap_estimates(findings: list[dict]) -> None:
+    """Para cada grupo con duplicación explícita, estima como máximo la licencia más barata."""
+    for item in findings:
+        if item["signal"] == "duplicación":
+            item["optimization_amount"] = 0.0
+    for _, items in similarity_groups(findings):
+        if any(item["signal"] == "duplicación" for item in items):
+            candidate = min(items, key=lambda item: item["monthly_amount"])
+            candidate["optimization_amount"] = candidate["monthly_amount"]
 
 
 def priority_score(item: dict) -> float:
@@ -497,6 +526,12 @@ def findings_table(findings: list[dict]) -> str:
     rows = []
     for priority, item in enumerate(findings, start=1):
         foreground, background = SIGNAL_META[item["signal"]]
+        estimate = item.get("optimization_amount", 0)
+        estimate_copy = (
+            f'<span class="estimate-copy">Oportunidad defendible: US$ {money(estimate)}/mes</span>'
+            if estimate > 0 else
+            '<span class="estimate-copy muted">Sin ahorro contabilizado hasta validar</span>'
+        )
         rows.append(
             f'<div class="finding-row">'
             f'<div class="service-cell"><strong>{html.escape(item["service"])}</strong>'
@@ -504,6 +539,7 @@ def findings_table(findings: list[dict]) -> str:
             f'<span>{html.escape(item["detail"])}</span>'
             f'<span class="evidence-copy">{html.escape(item.get("basis", "Inferencia de IA"))} · confianza {html.escape(item.get("confidence", "media"))}</span>'
             + (f'<span class="fact-copy">{" · ".join(html.escape(flag) for flag in item.get("flags", []))}</span>' if item.get("flags") else '') +
+            estimate_copy +
             f'<span class="action-copy">Siguiente acción: {html.escape(item.get("action", SIGNAL_ACTIONS[item["signal"]]))}</span></div>'
             f'<div class="amount-cell">US$ {money(item["monthly_amount"])}/mes</div>'
             f'<div><span class="signal" style="color:{foreground};background:{background};'
@@ -582,6 +618,8 @@ st.markdown(
       .service-cell .evidence-copy { color:#91a399; font-size:.72rem; }
       .service-cell .fact-copy { color:#70e795; font-size:.72rem; font-weight:750; }
       .service-cell .priority-copy { color:#ff9a55; font-size:.68rem; font-weight:850; text-transform:uppercase; letter-spacing:.08em; }
+      .service-cell .estimate-copy { color:#70e795; font-size:.74rem; font-weight:800; }
+      .service-cell .estimate-copy.muted { color:#71847a; font-weight:650; }
       .amount-cell { color:#dbe5df; font-weight:750; }
       .signal { display:inline-flex; padding:.37rem .7rem; border:1px solid; border-radius:999px; font-size:.75rem; font-weight:800; white-space:nowrap; }
       .demo-note { margin-top:1rem; color:#687a70; font-size:.78rem; }
@@ -727,6 +765,8 @@ if analyze:
 if st.session_state.get("findings"):
     all_findings = st.session_state["findings"]
     findings = current_stack(all_findings)
+    add_conservative_overlap_estimates(findings)
+    findings = sorted(findings, key=priority_score, reverse=True)
     evidence = st.session_state.get("evidence", [])
     monthly_potential = sum(item.get("optimization_amount", item["monthly_amount"] if item["signal"] != "normal" else 0) for item in findings)
     annual_potential = monthly_potential * 12
@@ -751,7 +791,7 @@ if st.session_state.get("findings"):
           <div class="results-label">Análisis listo · {st.session_state['record_count']} gastos recibidos</div>
           <div class="saving"><strong>US$ {money(annual_potential)}</strong> de potencial de optimización anual</div>
           <div class="saving-sub">US$ {money(monthly_potential)} por mes para revisar · Stack analizado: US$ {money(monthly_stack)}/mes.</div>
-          <div class="saving-explainer">Potencial estimado si revisás licencias duplicadas, poco usadas o innecesarias. No es un ahorro garantizado.</div>
+          <div class="saving-explainer">Estimación conservadora: solo diferencias de precio comprobadas, falta de uso con evidencia y el menor costo de un grupo con duplicación explícita. No es un ahorro garantizado.</div>
           <div class="result-summary">
             <span class="summary-pill opportunity">{opportunity_count} {opportunity_label}</span>
             <span class="summary-pill normal">{normal_count} {normal_label}</span>

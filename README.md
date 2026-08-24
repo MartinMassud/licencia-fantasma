@@ -31,6 +31,8 @@ También podés definir la variable de entorno `GROQ_API_KEY`.
 - Stack actual sin duplicar cobros históricos y ranking por impacto, urgencia y confianza.
 - Resumen de licencias activas/inactivas declaradas y renovaciones dentro de 30 días.
 - Agrupación por función para detectar posibles solapamientos entre licencias similares y ver su costo mensual conjunto.
+- Carga simultánea de múltiples CSV, PDF o imágenes y comparación histórica entre facturas, incluso con encabezados CSV repetidos.
+- Potencial conservador: renovaciones y señales para revisar no se cuentan como ahorro; solo aumentos comprobados, falta de uso con evidencia y el menor costo de una duplicación explícita.
 
 ## CSV con evidencia opcional
 
